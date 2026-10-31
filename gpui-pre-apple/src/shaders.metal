@@ -899,6 +899,16 @@ fragment float4 surface_fragment(SurfaceFragmentInput input [[stage_in]],
   return ycbcrToRGBTransform * ycbcr;
 }
 
+// A BGRA surface holds premultiplied colour; the surfaces' pipeline blends straight colour by its
+// alpha, so the colour is unpremultiplied here.
+fragment float4 bgra_surface_fragment(SurfaceFragmentInput input [[stage_in]],
+                                      texture2d<float> bgra_texture
+                                      [[texture(SurfaceInputIndex_BgraTexture)]]) {
+  constexpr sampler texture_sampler(mag_filter::linear, min_filter::linear);
+  float4 color = bgra_texture.sample(texture_sampler, input.texture_position);
+  return color.a > 0.0 ? float4(color.rgb / color.a, color.a) : float4(0.0);
+}
+
 float4 hsla_to_rgba(Hsla hsla) {
   float h = hsla.h * 6.0; // Now, it's an angle but scaled in [0, 6) range
   float s = hsla.s;

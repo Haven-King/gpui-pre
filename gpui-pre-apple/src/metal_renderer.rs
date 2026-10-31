@@ -13,7 +13,7 @@ use objc2::runtime::AnyObject;
 use core_foundation::base::TCFType;
 use core_video::{
     metal_texture::CVMetalTextureGetTexture, metal_texture_cache::CVMetalTextureCache,
-    pixel_buffer::kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
+    pixel_buffer::{CVPixelBuffer, kCVPixelFormatType_32BGRA, kCVPixelFormatType_420YpCbCr8BiPlanarFullRange},
 };
 use foreign_types::{ForeignType, ForeignTypeRef};
 use metal::{
@@ -123,6 +123,11 @@ pub struct MetalRenderer {
     monochrome_sprites_pipeline_state: metal::RenderPipelineState,
     polychrome_sprites_pipeline_state: metal::RenderPipelineState,
     surfaces_pipeline_state: metal::RenderPipelineState,
+    bgra_surfaces_pipeline_state: metal::RenderPipelineState,
+    /// The surfaces the frame being encoded samples, their pixel buffers and Core Video textures,
+    /// held until its command buffer completes: a producer that reuses a buffer once it is released
+    /// (a `CVPixelBufferPool`, say) must not overwrite it while the GPU still reads it.
+    surface_textures: Vec<(CVPixelBuffer, Vec<core_video::metal_texture::CVMetalTexture>)>,
     unit_vertices: metal::Buffer,
     #[allow(clippy::arc_with_non_send_sync)]
     instance_buffer_pool: Arc<Mutex<InstanceBufferPool>>,
@@ -358,6 +363,14 @@ impl MetalRenderer {
             "surface_fragment",
             MTLPixelFormat::BGRA8Unorm,
         );
+        let bgra_surfaces_pipeline_state = build_pipeline_state(
+            &device,
+            &library,
+            "bgra_surfaces",
+            "surface_vertex",
+            "bgra_surface_fragment",
+            MTLPixelFormat::BGRA8Unorm,
+        );
 
         let command_queue = device.new_command_queue();
         let supports_shared_storage = cfg!(target_os = "ios") || is_apple_gpu;
@@ -381,6 +394,8 @@ impl MetalRenderer {
             monochrome_sprites_pipeline_state,
             polychrome_sprites_pipeline_state,
             surfaces_pipeline_state,
+            bgra_surfaces_pipeline_state,
+            surface_textures: Vec::new(),
             unit_vertices,
             instance_buffer_pool,
             sprite_atlas,
@@ -547,10 +562,12 @@ impl MetalRenderer {
 
         let instance_buffer_pool = self.instance_buffer_pool.clone();
         let instance_buffer = Cell::new(Some(writer.finish()));
+        let surface_textures = Cell::new(mem::take(&mut self.surface_textures));
         let block = RcBlock::new(move |_: ptr::NonNull<AnyObject>| {
             if let Some(instance_buffer) = instance_buffer.take() {
                 instance_buffer_pool.lock().release(instance_buffer);
             }
+            drop(surface_textures.take());
         });
         // SAFETY: Both pointee types are opaque views of the same Objective-C block pointer ABI.
         unsafe {
@@ -1174,7 +1191,6 @@ impl MetalRenderer {
             return;
         }
 
-        command_encoder.set_render_pipeline_state(&self.surfaces_pipeline_state);
         command_encoder.set_vertex_buffer(
             SurfaceInputIndex::Vertices as u64,
             Some(&self.unit_vertices),
@@ -1196,49 +1212,70 @@ impl MetalRenderer {
                 DevicePixels::from(surface.image_buffer.get_width() as i32),
                 DevicePixels::from(surface.image_buffer.get_height() as i32),
             );
-
-            assert_eq!(
-                surface.image_buffer.get_pixel_format(),
-                kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
-            );
-
-            let y_texture = self
-                .core_video_texture_cache
-                .create_texture_from_image(
-                    surface.image_buffer.as_concrete_TypeRef(),
-                    None,
-                    MTLPixelFormat::R8Unorm,
-                    surface.image_buffer.get_width_of_plane(0),
-                    surface.image_buffer.get_height_of_plane(0),
-                    0,
-                )
-                .unwrap();
-            let cb_cr_texture = self
-                .core_video_texture_cache
-                .create_texture_from_image(
-                    surface.image_buffer.as_concrete_TypeRef(),
-                    None,
-                    MTLPixelFormat::RG8Unorm,
-                    surface.image_buffer.get_width_of_plane(1),
-                    surface.image_buffer.get_height_of_plane(1),
-                    1,
-                )
-                .unwrap();
-
             command_encoder.set_vertex_bytes(
                 SurfaceInputIndex::TextureSize as u64,
                 mem::size_of_val(&texture_size) as u64,
                 &texture_size as *const Size<DevicePixels> as *const _,
             );
-            // let y_texture = y_texture.get_texture().unwrap().
-            command_encoder.set_fragment_texture(SurfaceInputIndex::YTexture as u64, unsafe {
-                let texture = CVMetalTextureGetTexture(y_texture.as_concrete_TypeRef());
-                Some(metal::TextureRef::from_ptr(texture as *mut _))
-            });
-            command_encoder.set_fragment_texture(SurfaceInputIndex::CbCrTexture as u64, unsafe {
-                let texture = CVMetalTextureGetTexture(cb_cr_texture.as_concrete_TypeRef());
-                Some(metal::TextureRef::from_ptr(texture as *mut _))
-            });
+
+            let pixel_format = surface.image_buffer.get_pixel_format();
+            if pixel_format == kCVPixelFormatType_32BGRA {
+                // A single-plane, premultiplied BGRA buffer, such as an IOSurface another
+                // GPU API renders into: sampled as is, with no conversion.
+                let Ok(texture) = self.core_video_texture_cache.create_texture_from_image(
+                    surface.image_buffer.as_concrete_TypeRef(),
+                    None,
+                    MTLPixelFormat::BGRA8Unorm,
+                    surface.image_buffer.get_width(),
+                    surface.image_buffer.get_height(),
+                    0,
+                ) else {
+                    log::error!("failed to create a Metal texture for a BGRA surface");
+                    continue;
+                };
+                command_encoder.set_render_pipeline_state(&self.bgra_surfaces_pipeline_state);
+                command_encoder.set_fragment_texture(SurfaceInputIndex::BgraTexture as u64, unsafe {
+                    let texture = CVMetalTextureGetTexture(texture.as_concrete_TypeRef());
+                    Some(metal::TextureRef::from_ptr(texture as *mut _))
+                });
+                self.surface_textures.push((surface.image_buffer.clone(), vec![texture]));
+            } else {
+                assert_eq!(pixel_format, kCVPixelFormatType_420YpCbCr8BiPlanarFullRange);
+
+                let y_texture = self
+                    .core_video_texture_cache
+                    .create_texture_from_image(
+                        surface.image_buffer.as_concrete_TypeRef(),
+                        None,
+                        MTLPixelFormat::R8Unorm,
+                        surface.image_buffer.get_width_of_plane(0),
+                        surface.image_buffer.get_height_of_plane(0),
+                        0,
+                    )
+                    .unwrap();
+                let cb_cr_texture = self
+                    .core_video_texture_cache
+                    .create_texture_from_image(
+                        surface.image_buffer.as_concrete_TypeRef(),
+                        None,
+                        MTLPixelFormat::RG8Unorm,
+                        surface.image_buffer.get_width_of_plane(1),
+                        surface.image_buffer.get_height_of_plane(1),
+                        1,
+                    )
+                    .unwrap();
+
+                command_encoder.set_render_pipeline_state(&self.surfaces_pipeline_state);
+                command_encoder.set_fragment_texture(SurfaceInputIndex::YTexture as u64, unsafe {
+                    let texture = CVMetalTextureGetTexture(y_texture.as_concrete_TypeRef());
+                    Some(metal::TextureRef::from_ptr(texture as *mut _))
+                });
+                command_encoder.set_fragment_texture(SurfaceInputIndex::CbCrTexture as u64, unsafe {
+                    let texture = CVMetalTextureGetTexture(cb_cr_texture.as_concrete_TypeRef());
+                    Some(metal::TextureRef::from_ptr(texture as *mut _))
+                });
+                self.surface_textures.push((surface.image_buffer.clone(), vec![y_texture, cb_cr_texture]));
+            }
 
             command_encoder.draw_primitives_instanced_base_instance(
                 metal::MTLPrimitiveType::Triangle,
@@ -1618,6 +1655,7 @@ enum SurfaceInputIndex {
     TextureSize = 3,
     YTexture = 4,
     CbCrTexture = 5,
+    BgraTexture = 6,
 }
 
 #[repr(C)]
