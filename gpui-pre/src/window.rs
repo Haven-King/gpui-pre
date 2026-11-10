@@ -5089,6 +5089,17 @@ impl Window {
         )
     }
 
+    /// Runs `f` with the layouts it requests keeping their authored lengths (sizes, padding,
+    /// margins, gaps, insets) and their measured sizes as fractional device pixels, rather than
+    /// rounding each to a whole device pixel before layout. Each element's edges are still snapped
+    /// to device pixels after layout, so no rounding error accumulates along a row. Call it from an
+    /// element's `request_layout` around its children's: for a subtree whose lengths all scale by
+    /// one continuous factor (drawn at a canvas's zoom), whose rows otherwise jump as their lengths
+    /// cross a rounding threshold together.
+    pub fn with_unsnapped_metrics<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
+        crate::taffy::with_unsnapped_metrics(|| f(self))
+    }
+
     /// Add a node to the layout tree for the current frame. Instead of taking a `Style` and children,
     /// this variant takes a function that is invoked during layout so you can use arbitrary logic to
     /// determine the element's size. One place this is used internally is when measuring text.

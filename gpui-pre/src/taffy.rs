@@ -7,7 +7,7 @@ use crate::{
     },
 };
 use collections::{FxHashMap, FxHashSet};
-use std::{fmt::Debug, ops::Range};
+use std::{cell::Cell, fmt::Debug, ops::Range};
 use taffy::{
     TaffyTree, TraversePartialTree as _,
     geometry::{Point as TaffyPoint, Rect as TaffyRect, Size as TaffySize},
@@ -27,6 +27,31 @@ type NodeMeasureFn = StackSafe<Box<MeasureFn>>;
 
 struct NodeContext {
     measure: NodeMeasureFn,
+    /// Whether the measured size is rounded up to whole device pixels: false for a node requested
+    /// inside [`Window::with_unsnapped_metrics`].
+    snap: bool,
+}
+
+thread_local! {
+    /// Whether the layouts requested now have their authored lengths rounded to whole device
+    /// pixels before layout (phase 1 of the pixel snapping below). Edges are snapped after layout
+    /// whatever it says.
+    static SNAP_METRICS: Cell<bool> = const { Cell::new(true) };
+}
+
+/// Runs `f` with the layouts it requests keeping their authored lengths and measured sizes as
+/// fractional device pixels, each element's edges still snapped once after layout. For a subtree
+/// whose lengths all scale by one continuous factor, where rounding each length on its own makes
+/// the lengths of a row cross a rounding threshold together and the row jump.
+pub(crate) fn with_unsnapped_metrics<R>(f: impl FnOnce() -> R) -> R {
+    let was = SNAP_METRICS.with(|snap| snap.replace(false));
+    let result = f();
+    SNAP_METRICS.with(|snap| snap.set(was));
+    result
+}
+
+fn snapping_metrics() -> bool {
+    SNAP_METRICS.with(Cell::get)
 }
 pub struct TaffyLayoutEngine {
     taffy: TaffyTree<NodeContext>,
@@ -101,7 +126,13 @@ impl TaffyLayoutEngine {
         let measure = StackSafe::new(measure);
 
         self.taffy
-            .new_leaf_with_context(taffy_style, NodeContext { measure })
+            .new_leaf_with_context(
+                taffy_style,
+                NodeContext {
+                    measure,
+                    snap: snapping_metrics(),
+                },
+            )
             .expect(EXPECT_MESSAGE)
             .into()
     }
@@ -261,7 +292,13 @@ impl TaffyLayoutEngine {
 
                     let measured_size: Size<Pixels> =
                         (node_context.measure)(known_dimensions, available_space, window, cx);
-                    snap_measured_size_to_device_pixels(measured_size, scale_factor).into()
+                    if node_context.snap {
+                        snap_measured_size_to_device_pixels(measured_size, scale_factor).into()
+                    } else {
+                        measured_size
+                            .map(|d| d.0.max(0.0) * scale_factor)
+                            .into()
+                    }
                 },
             )
             .expect(EXPECT_MESSAGE);
@@ -522,7 +559,11 @@ impl ToTaffy<taffy::style::Style> for Style {
 
 impl ToTaffy<f32> for AbsoluteLength {
     fn to_taffy(&self, rem_size: Pixels, scale_factor: f32) -> f32 {
-        round_to_device_pixel(self.to_pixels(rem_size).0, scale_factor)
+        if snapping_metrics() {
+            round_to_device_pixel(self.to_pixels(rem_size).0, scale_factor)
+        } else {
+            self.to_pixels(rem_size).0 * scale_factor
+        }
     }
 }
 
