@@ -651,6 +651,10 @@ impl TextLayout {
         } else {
             vec![text_style.to_run(text.len())]
         };
+        // Inside `Window::with_unsnapped_metrics` a text's width stays as shaped: rounded up to a
+        // whole logical pixel, text aligned to the right or centered moves by that pixel at once
+        // as its size grows.
+        let whole_width = crate::taffy::snapping_metrics();
         window.request_measured_layout(Default::default(), {
             let element_state = self.clone();
 
@@ -769,7 +773,10 @@ impl TextLayout {
                 for line in &lines {
                     let line_size = line.size(line_height);
                     size.height += line_size.height;
-                    size.width = size.width.max(line_size.width).ceil();
+                    size.width = size.width.max(line_size.width);
+                }
+                if whole_width {
+                    size.width = size.width.ceil();
                 }
 
                 element_state.0.borrow_mut().replace(TextLayoutInner {

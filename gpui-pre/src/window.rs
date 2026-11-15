@@ -5091,7 +5091,8 @@ impl Window {
 
     /// Runs `f` with the layouts it requests keeping their authored lengths (sizes, padding,
     /// margins, gaps, insets) and their measured sizes as fractional device pixels, rather than
-    /// rounding each to a whole device pixel before layout. Each element's edges are still snapped
+    /// rounding each to a whole device pixel before layout; a text keeps its shaped width, rather
+    /// than one rounded up to a whole logical pixel. Each element's edges are still snapped
     /// to device pixels after layout, so no rounding error accumulates along a row. Call it from an
     /// element's `request_layout` around its children's: for a subtree whose lengths all scale by
     /// one continuous factor (drawn at a canvas's zoom), whose rows otherwise jump as their lengths

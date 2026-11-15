@@ -50,7 +50,7 @@ pub(crate) fn with_unsnapped_metrics<R>(f: impl FnOnce() -> R) -> R {
     result
 }
 
-fn snapping_metrics() -> bool {
+pub(crate) fn snapping_metrics() -> bool {
     SNAP_METRICS.with(Cell::get)
 }
 pub struct TaffyLayoutEngine {
